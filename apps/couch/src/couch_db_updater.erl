@@ -20,8 +20,7 @@
 -include("couch_db.hrl").
 
 
-init({MainPid, DbName, Filepath, Fd, Options}) ->
-    process_flag(trap_exit, true),
+init({DbName, Filepath, Fd, Options}) ->
     case lists:member(create, Options) of
     true ->
         % create a new header and writes it to the file
@@ -44,26 +43,36 @@ init({MainPid, DbName, Filepath, Fd, Options}) ->
     end,
     ReaderFd = open_reader_fd(Filepath, Options),
     Db = init_db(DbName, Filepath, Fd, ReaderFd, Header, Options),
+    couch_stats_collector:track_process_count({couchdb, open_databases}),
+
     Db2 = refresh_validate_doc_funs(Db),
-    {ok, Db2#db{main_pid = MainPid}}.
+    {ok, Db2#db{main_pid = self()}}.
 
 
 terminate(_Reason, Db) ->
     ok = couch_file:close(Db#db.updater_fd),
     ok = couch_file:close(Db#db.fd),
     couch_util:shutdown_sync(Db#db.compactor_pid),
-    couch_util:shutdown_sync(Db#db.fd_ref_counter),
+    couch_util:shutdown_sync(Db#db.fd),
     ok.
 
 handle_call(get_db, _From, Db) ->
     {reply, {ok, Db}, Db};
 handle_call(full_commit, _From, #db{waiting_delayed_commit=nil}=Db) ->
     {reply, ok, Db}; % no data waiting, return ok immediately
+
 handle_call(full_commit, _From,  Db) ->
+    {reply, ok, commit_data(Db)}; % commit the data and return ok
+handle_call({full_commit, _}, _From, #db{waiting_delayed_commit=nil}=Db) ->
+    {reply, ok, Db}; % no data waiting, return ok immediately
+handle_call({full_commit, RequiredSeq}, _From, Db) when RequiredSeq =<
+        Db#db.committed_update_seq ->
+    {reply, ok, Db};
+handle_call({full_commit, _}, _, Db) ->
     {reply, ok, commit_data(Db)}; % commit the data and return ok
 handle_call(increment_update_seq, _From, Db) ->
     Db2 = commit_data(Db#db{update_seq=Db#db.update_seq+1}),
-    ok = gen_server:call(Db2#db.main_pid, {db_updated, Db2}),
+    ok = gen_server:call(couch_server, {db_updated, Db2}, infinity),
     couch_db_update_notifier:notify({updated, Db#db.name}),
     {reply, {ok, Db2#db.update_seq}, Db2};
 
@@ -72,13 +81,13 @@ handle_call({set_security, NewSec}, _From, #db{compression = Comp} = Db) ->
         Db#db.updater_fd, NewSec, [{compression, Comp}]),
     Db2 = commit_data(Db#db{security=NewSec, security_ptr=Ptr,
             update_seq=Db#db.update_seq+1}),
-    ok = gen_server:call(Db2#db.main_pid, {db_updated, Db2}),
+    ok = gen_server:call(couch_server, {db_updated, Db2}, infinity),
     {reply, ok, Db2};
 
 handle_call({set_revs_limit, Limit}, _From, Db) ->
     Db2 = commit_data(Db#db{revs_limit=Limit,
             update_seq=Db#db.update_seq+1}),
-    ok = gen_server:call(Db2#db.main_pid, {db_updated, Db2}),
+    ok = gen_server:call(couch_server, {db_updated, Db2}, infinity),
     {reply, ok, Db2};
 
 handle_call({purge_docs, _IdRevs}, _From,
@@ -147,9 +156,8 @@ handle_call({purge_docs, IdRevs}, _From, Db) ->
             docinfo_by_seq_btree = DocInfoBySeqBTree2,
             update_seq = NewSeq + 1,
             header=Header#db_header{purge_seq=PurgeSeq+1, purged_docs=Pointer}}),
-
-    ok = gen_server:call(Db2#db.main_pid, {db_updated, Db2}),
     couch_db_update_notifier:notify({updated, Db#db.name}),
+    ok = gen_server:call(couch_server, {db_updated, Db2}, infinity),
     {reply, {ok, (Db2#db.header)#db_header.purge_seq, IdRevsPurged}, Db2};
 handle_call(start_compact, _From, Db) ->
     case Db#db.compactor_pid of
@@ -157,7 +165,7 @@ handle_call(start_compact, _From, Db) ->
         ?LOG_INFO("Starting compaction for db \"~s\"", [Db#db.name]),
         Pid = spawn_link(fun() -> start_copy_compact(Db) end),
         Db2 = Db#db{compactor_pid=Pid},
-        ok = gen_server:call(Db#db.main_pid, {db_updated, Db2}),
+        ok = gen_server:call(couch_server, {db_updated, Db2}, infinity),
         {reply, {ok, Pid}, Db2};
     _ ->
         % compact currently running, this is a no-op
@@ -202,7 +210,7 @@ handle_call({compact_done, CompactFilepath}, _From, #db{filepath=Filepath}=Db) -
         ok = file:rename(CompactFilepath, Filepath),
         close_db(Db),
         NewDb3 = refresh_validate_doc_funs(NewDb2),
-        ok = gen_server:call(Db#db.main_pid, {db_updated, NewDb3}, infinity),
+        ok = gen_server:call(couch_server, {db_updated, NewDb3}, infinity),
         couch_db_update_notifier:notify({compacted, NewDb3#db.name}),
         ?LOG_INFO("Compaction for db \"~s\" completed.", [Db#db.name]),
         {reply, ok, NewDb3#db{compactor_pid=nil}};
@@ -235,7 +243,7 @@ handle_info({update_docs, Client, GroupedDocs, NonRepDocs, MergeConflicts,
     try update_docs_int(Db, GroupedDocs3, NonRepDocs2, MergeConflicts,
                 FullCommit2) of
     {ok, Db2} ->
-        ok = gen_server:call(Db#db.main_pid, {db_updated, Db2}),
+        ok = gen_server:call(couch_server, {db_updated, Db2}, infinity),
         if Db2#db.update_seq /= Db#db.update_seq ->
             couch_db_update_notifier:notify({updated, Db2#db.name});
         true -> ok
@@ -255,13 +263,16 @@ handle_info(delayed_commit, Db) ->
         Db ->
             {noreply, Db};
         Db2 ->
-            ok = gen_server:call(Db2#db.main_pid, {db_updated, Db2}),
+            ok = gen_server:call(couch_server, {db_updated, Db2}, infinity),
             {noreply, Db2}
     end;
 handle_info({'EXIT', _Pid, normal}, Db) ->
     {noreply, Db};
 handle_info({'EXIT', _Pid, Reason}, Db) ->
-    {stop, Reason, Db}.
+    {stop, Reason, Db};
+handle_info({'DOWN', Ref, _, _, Reason}, #db{fd_monitor=Ref, name=Name} = Db) ->
+    ?LOG_ERROR("DB ~s shutting down - Fd ~p", [Name, Reason]),
+    {stop, normal, Db}.
 
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
@@ -429,7 +440,7 @@ init_db(DbName, Filepath, Fd, ReaderFd, Header0, Options) ->
                     "[before_header, after_header, on_file_open]")),
 
     case lists:member(on_file_open, FsyncOptions) of
-    true -> ok = couch_file:sync(Fd);
+    true -> ok = couch_file:sync(Filepath);
     _ -> ok
     end,
 
@@ -458,12 +469,10 @@ init_db(DbName, Filepath, Fd, ReaderFd, Header0, Options) ->
     {MegaSecs, Secs, MicroSecs} = now(),
     StartTime = ?l2b(io_lib:format("~p",
             [(MegaSecs*1000000*1000000) + (Secs*1000000) + MicroSecs])),
-    {ok, RefCntr} = couch_ref_counter:start([Fd, ReaderFd]),
     #db{
-        update_pid=self(),
         fd = ReaderFd,
+        fd_monitor = erlang:monitor(process, ReaderFd),
         updater_fd = Fd,
-        fd_ref_counter = RefCntr,
         header=Header,
         fulldocinfo_by_id_btree = IdBtree,
         docinfo_by_seq_btree = SeqBtree,
@@ -491,8 +500,8 @@ open_reader_fd(Filepath, Options) ->
     unlink(Fd),
     Fd.
 
-close_db(#db{fd_ref_counter = RefCntr}) ->
-    couch_ref_counter:drop(RefCntr).
+close_db(#db{fd_monitor = Ref}) ->
+    erlang:demonitor(Ref).
 
 
 refresh_validate_doc_funs(Db) ->
@@ -987,7 +996,7 @@ start_copy_compact(#db{name=Name,filepath=Filepath,header=#db_header{purge_seq=P
     NewDb3 = copy_compact(Db, NewDb2, Retry),
     close_db(NewDb3),
     case gen_server:call(
-        Db#db.update_pid, {compact_done, CompactFile}, infinity) of
+        Db#db.main_pid, {compact_done, CompactFile}, infinity) of
     ok ->
         ok;
     {retry, CurrentDb} ->

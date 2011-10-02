@@ -187,12 +187,14 @@ sync(Filepath) when is_list(Filepath) ->
 sync(Fd) ->
     gen_server:call(Fd, sync, infinity).
 
-%%----------------------------------------------------------------------
+
+
+%----------------------------------------------------------------------
 %% Purpose: Close the file.
 %% Returns: ok
 %%----------------------------------------------------------------------
 close(Fd) ->
-    couch_util:shutdown_sync(Fd).
+    gen_server:call(Fd, close, infinity).
 
 
 delete(RootDir, Filepath) ->
@@ -269,6 +271,7 @@ init_status_error(ReturnPid, Ref, Error) ->
 
 init({Filepath, Options, ReturnPid, Ref}) ->
     process_flag(trap_exit, true),
+    erlang:send_after(60000, self(), maybe_close),
     OpenOptions = file_open_options(Options),
     case lists:member(create, Options) of
     true ->
@@ -321,18 +324,16 @@ file_open_options(Options) ->
         [append]
     end.
 
-maybe_track_open_os_files(FileOptions) ->
-    case lists:member(sys_db, FileOptions) of
-    true ->
-        ok;
-    false ->
-        couch_stats_collector:track_process_count({couchdb, open_os_files})
-    end.
-
+maybe_track_open_os_files(_FileOptions) ->
+    couch_stats_collector:track_process_count({couchdb, open_os_files}).
+ 
 terminate(_Reason, #file{fd = Fd}) ->
-    ok = file:close(Fd).
+    file:close(Fd).
 
 
+handle_call(close, _From, #file{fd=Fd}=File) ->
+    {stop, normal, file:close(Fd), File#file{fd = nil}};
+ 
 handle_call({pread_iolist, Pos}, _From, File) ->
     {RawData, NextPos} = try
         % up to 8Kbs of read ahead
@@ -403,6 +404,18 @@ handle_cast(close, Fd) ->
 code_change(_OldVsn, State, _Extra) ->
     {ok, State}.
 
+handle_info(maybe_close, Fd) ->
+    case process_info(self(), monitored_by) of
+    {monitored_by, [_StatsCollector]} ->
+        {stop, normal, Fd};
+    {monitored_by, []} ->
+        ?LOG_ERROR("~p ~p is un-monitored, maybe stats collector died",
+            [?MODULE, self()]),
+        {stop, normal, Fd};
+    _Else ->
+        erlang:send_after(10000, self(), maybe_close),
+        {noreply, Fd}
+    end;
 handle_info({'EXIT', _, normal}, Fd) ->
     {noreply, Fd};
 handle_info({'EXIT', _, Reason}, Fd) ->
